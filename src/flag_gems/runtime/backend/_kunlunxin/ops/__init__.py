@@ -19,6 +19,7 @@ from ._functional_sym_constrain_range_for_size import (
 )
 from ._is_all_true import _is_all_true
 from ._thnn_fused_lstm_cell_backward_impl import _thnn_fused_lstm_cell_backward_impl
+from ._jagged_to_padded_dense_forward import _jagged_to_padded_dense_forward
 from .abs import abs, abs_
 from .absolute import absolute
 from .acos import acos
