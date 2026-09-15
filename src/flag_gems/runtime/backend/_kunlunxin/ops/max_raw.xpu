@@ -1,0 +1,369 @@
+#include "max_common.inc"
+
+// ---------------- max_dim entry: K == 1 contiguous row reduce --------------
+
+// Vector-accumulate row reduce (technique ported from the vendor's native
+// max_min_dim kernel): keep a per-lane running max VECTOR plus per-lane index
+// vectors, updated with branch-free masked adds. The whole row costs ONE
+// cross-lane vrmax at the end, so the per-chunk compute stays cheap enough to
+// hide behind the DMA pipeline (measured: 65us -> 44.7us on [4096,4096] fp32,
+// vs 44.0us pure-DMA). The old vrmax-per-vector + branch + winner-copy proc
+// serializes ~0.6us per 3KB chunk and caps at ~1.0TB/s.
+// The index vectors live in LM (not registers): the payload is inlined into a
+// Triton kernel wrapper whose prologue consumes vector registers, and 4
+// persistent vector states overflow the register allocator
+// ("can not find free phyReg in a NoReg pass").
+struct VecRow {
+  float32x16_t v_val;    // register-resident per-lane running max (f32 domain)
+  int32x16_t v_idx;      // register-resident per-lane index of the running max
+  __local__ int *lm_ril; // auto-increment index vector, low half
+  int ri_delta;          // ri_h lane i = ri_l lane i + delta (16 or 1)
+};
+
+static __device__ __attribute__((always_inline)) void vec_row_init(
+    VecRow *rv, int type_code) {
+  rv->v_val = float32x16_t(-__builtin_huge_valf());
+  rv->v_idx = int32x16_t(0);
+  if (type_code == T_BF16) {
+    // bf16 lanes: l = even elements (2k), h = odd elements (2k+1)
+    int32x16_t il = {-32, -30, -28, -26, -24, -22, -20, -18, -16, -14,
+                     -12, -10, -8, -6, -4, -2};
+    rv->ri_delta = 1;
+    vstore_lm_int32x16(rv->lm_ril, il);
+  } else {
+    int32x16_t il = {-32, -31, -30, -29, -28, -27, -26, -25, -24, -23,
+                     -22, -21, -20, -19, -18, -17};
+    rv->ri_delta = 16;
+    vstore_lm_int32x16(rv->lm_ril, il);
+  }
+  mfence_lm();
+}
+
+static __device__ __attribute__((always_inline)) void vec_bump(
+    __local__ int *ri) {
+  int32x16_t v = vload_lm_int32x16(ri);
+  v = svadd_int32x16(32, v);
+  vstore_lm_int32x16(ri, v);
+}
+
+// update one 16-lane half: strict > keeps the earlier index on ties
+static __device__ __attribute__((always_inline)) void vec_acc(
+    VecRow *rv, float32x16_t cur, int32x16_t ri) {
+  int mask = vvlt_float32x16(rv->v_val, cur);
+  rv->v_idx = vvadd_int32x16(svadd_int32x16_mz(0, rv->v_idx, ~mask),
+                             svadd_int32x16_mz(0, ri, mask));
+  rv->v_val = vvmax_float32x16(rv->v_val, cur);
+}
+
+// pad the chunk tail with the dtype's -FLT_MAX cast so partial groups never
+// win (vendor memset_lm_unalign pattern); len is rounded up to a multiple of
+// 32 within the chunk buffer (chunk_elems is always a multiple of 32).
+static __device__ __attribute__((always_inline)) int vec_pad(
+    __local__ char *buf, int len, int esz, int type_code) {
+  int rem = len % 32;
+  if (rem == 0) return len;
+  int padded = len + (32 - rem);
+  if (type_code == T_F32) {
+    __local__ float *f = (__local__ float *)buf;
+    for (int i = len; i < padded; ++i) f[i] = -3.4028235e+38f;
+  } else if (type_code == T_F16) {
+    __local__ _Float16 *f = (__local__ _Float16 *)buf;
+    _Float16 pad = (_Float16)(-3.4028235e+38f);
+    for (int i = len; i < padded; ++i) f[i] = pad;
+  } else {
+    __local__ unsigned short *f = (__local__ unsigned short *)buf;
+    unsigned short pad = 0xFF80;  // bf16 -inf
+    for (int i = len; i < padded; ++i) f[i] = pad;
+  }
+  mfence_lm();
+  return padded;
+}
+
+static __device__ __attribute__((always_inline)) void vproc_f32(
+    __local__ char *buf, int len, VecRow *rv) {
+  __local__ float *f = (__local__ float *)buf;
+  int plen = vec_pad(buf, len, 4, T_F32);
+  for (int i = 0; i < plen; i += 32) {
+    vec_bump(rv->lm_ril);
+    int32x16_t ri = vload_lm_int32x16(rv->lm_ril);
+    int32x16_t rih = svadd_int32x16(rv->ri_delta, ri);
+    float32x16_t vl = vload_lm_float32x16(f + i);
+    float32x16_t vh = vload_lm_float32x16(f + i + 16);
+    vec_acc(rv, vl, ri);
+    vec_acc(rv, vh, rih);
+  }
+}
+
+static __device__ __attribute__((always_inline)) void vproc_f16(
+    __local__ char *buf, int len, VecRow *rv) {
+  __local__ _Float16 *f = (__local__ _Float16 *)buf;
+  int plen = vec_pad(buf, len, 2, T_F16);
+  for (int i = 0; i < plen; i += 32) {
+    vec_bump(rv->lm_ril);
+    int32x16_t ri = vload_lm_int32x16(rv->lm_ril);
+    int32x16_t rih = svadd_int32x16(rv->ri_delta, ri);
+    float16x32_t x = vload_lm_float16x32(f + i);
+    vec_acc(rv, vfp162float_l(x), ri);
+    vec_acc(rv, vfp162float_h(x), rih);
+  }
+}
+
+static __device__ __attribute__((always_inline)) void vproc_bf16(
+    __local__ char *buf, int len, VecRow *rv) {
+  __local__ int *f = (__local__ int *)buf;
+  int plen = vec_pad(buf, len, 2, T_BF16);
+  for (int i = 0; i < plen; i += 32) {
+    vec_bump(rv->lm_ril);
+    int32x16_t ri = vload_lm_int32x16(rv->lm_ril);
+    int32x16_t rih = svadd_int32x16(rv->ri_delta, ri);
+    int32x16_t pr = vload_lm_int32x16(f + (i >> 1));
+    // little-endian packing: element 2k is the LOW 16 bits of int32 k ->
+    // shift up to the f32 position gives the even (earlier) elements
+    float32x16_t ve = reinterpret_cast<float32x16_t>(
+        svsll_int32x16(16, pr));
+    // element 2k+1 is the HIGH 16 bits, already in the f32 position
+    float32x16_t vo = reinterpret_cast<float32x16_t>(
+        svand_int32x16((int)0xFFFF0000, pr));
+    vec_acc(rv, ve, ri);
+    vec_acc(rv, vo, rih);
+  }
+}
+
+// row-end resolve: one cross-lane max, then the first (smallest) index among
+// the lanes holding it
+static __device__ __attribute__((always_inline)) void vec_reduce(
+    VecRow *rv, __local__ int *lm_scan, float *out_val, int *out_idx) {
+  float val = vrmax_float32x16(rv->v_val);
+  int mask = sveq_float32x16(val, rv->v_val);
+  vstore_lm_int32x16(lm_scan, rv->v_idx);
+  mfence_lm();
+  int idx = 0x7FFFFFFF;
+  for (int i = 0; i < 16; ++i) {
+    if ((mask & 0xFFFF) & (1 << i)) {
+      if (lm_scan[i] < idx) idx = lm_scan[i];
+    }
+  }
+  if (idx == 0x7FFFFFFF) idx = 0;
+  *out_val = val;
+  *out_idx = idx;
+}
+
+// vector-accumulate window pipeline (float dtypes). Disjoint from the legacy
+// path so the two never share a basic block: mixing the 4 vector state
+// registers with the legacy scalar state overflows the register allocator
+// ("can not find free phyReg in a NoReg pass").
+static __device__ __attribute__((always_inline)) void md_row_vec(
+    _global_ptr_ const char *in, _global_ptr_ char *out_val,
+    _global_ptr_ long long *out_idx,
+    int M, int N, int esz, int type_code,
+    int my0, int my1, int chunk_elems, int nch) {
+  __attribute__((aligned(64))) __local__ char buf[NBUF][CHUNK_BYTES];
+  __local__ int lm_scan[16];
+  __local__ int lm_ril[16];
+  __local__ char stage_v[64 * 8];
+  __local__ long long stage_i[64];
+
+  for (int w = my0; w < my1; w += 64) {
+    int wend = w + 64 < my1 ? w + 64 : my1;
+    int total = (wend - w) * nch;
+
+    {
+      int off = 0;
+      int len = N - off < chunk_elems ? N - off : chunk_elems;
+      GM2LM_ASYNC(in + ((long long)w * N + off) * esz, buf[0], len * esz);
+    }
+    VecRow vrow;
+    vrow.lm_ril = lm_ril;
+    int cur_row = -1;
+
+    for (int s = 0; s < total; ++s) {
+      int j = s / nch;
+      int c = s - j * nch;
+      int row = w + j;
+      mfence_lm();  // LM-only fence: GM2LM lands in LM
+      if (s + 1 < total) {
+        int j1 = (s + 1) / nch;
+        int c1 = (s + 1) - j1 * nch;
+        int row1 = w + j1;
+        int off = c1 * chunk_elems;
+        int len = N - off < chunk_elems ? N - off : chunk_elems;
+        GM2LM_ASYNC(in + ((long long)row1 * N + off) * esz, buf[(s + 1) & 1],
+                    len * esz);
+      }
+      if (row != cur_row) {
+        if (cur_row >= 0) {
+          float v; int ix;
+          vec_reduce(&vrow, lm_scan, &v, &ix);
+          int q = cur_row - w;
+          stage_val((__local__ char *)stage_v, q, esz, v, (_Float16)v,
+                    0, 0, 0, 0, 0, 0.0, type_code);
+          stage_i[q] = ix;
+        }
+        vec_row_init(&vrow, type_code);
+        cur_row = row;
+      }
+      int off = c * chunk_elems;
+      int len = N - off < chunk_elems ? N - off : chunk_elems;
+      switch (type_code) {
+        case T_F32: vproc_f32(buf[s & 1], len, &vrow); break;
+        case T_F16: vproc_f16(buf[s & 1], len, &vrow); break;
+        default:    vproc_bf16(buf[s & 1], len, &vrow); break;
+      }
+    }
+    if (cur_row >= 0) {
+      float v; int ix;
+      vec_reduce(&vrow, lm_scan, &v, &ix);
+      int q = cur_row - w;
+      stage_val((__local__ char *)stage_v, q, esz, v, (_Float16)v,
+                0, 0, 0, 0, 0, 0.0, type_code);
+      stage_i[q] = ix;
+    }
+    int cnt = wend - w;
+    LM2GM_ASYNC(stage_v, out_val + (long long)w * esz, cnt * esz);
+    LM2GM_ASYNC(stage_i, out_idx + w, cnt * 8);
+  }
+  mfence();
+}
+
+// legacy scalar window pipeline (int / fp64 dtypes)
+static __device__ __attribute__((always_inline)) void md_row_legacy(
+    _global_ptr_ const char *in, _global_ptr_ char *out_val,
+    _global_ptr_ long long *out_idx,
+    int M, int N, int esz, int type_code,
+    int my0, int my1, int chunk_elems, int nch) {
+  __attribute__((aligned(64))) __local__ char buf[NBUF][CHUNK_BYTES];
+  __local__ _Float16 sv_f16[32];
+  __local__ int sv_i32[16];
+  __local__ char stage_v[64 * 8];
+  __local__ long long stage_i[64];
+
+  for (int w = my0; w < my1; w += 64) {
+    int wend = w + 64 < my1 ? w + 64 : my1;
+    int total = (wend - w) * nch;
+
+    {
+      int off = 0;
+      int len = N - off < chunk_elems ? N - off : chunk_elems;
+      GM2LM_ASYNC(in + ((long long)w * N + off) * esz, buf[0], len * esz);
+    }
+    float bestf = 0.f;
+    _Float16 besth = 0;
+    int besti = 0;
+    long long bestl = 0;
+    short bestw = 0;
+    signed char bestb = 0;
+    unsigned char bestub = 0;
+    double bestd = 0;
+    int bidx = 0;
+    int first = 1;
+    int sv_base = -1;
+    int cur_row = -1;
+
+    for (int s = 0; s < total; ++s) {
+      int j = s / nch;
+      int c = s - j * nch;
+      int row = w + j;
+      mfence_lm();
+      if (s + 1 < total) {
+        int j1 = (s + 1) / nch;
+        int c1 = (s + 1) - j1 * nch;
+        int row1 = w + j1;
+        int off = c1 * chunk_elems;
+        int len = N - off < chunk_elems ? N - off : chunk_elems;
+        GM2LM_ASYNC(in + ((long long)row1 * N + off) * esz, buf[(s + 1) & 1],
+                    len * esz);
+      }
+      if (row != cur_row) {
+        if (cur_row >= 0) {
+          if (sv_base >= 0) {
+            if (type_code == T_F16) bidx = resolve_f16(sv_f16, besth, sv_base);
+            else if (type_code == T_I32) bidx = resolve_i32(sv_i32, besti, sv_base);
+          }
+          int q = cur_row - w;
+          stage_val((__local__ char *)stage_v, q, esz, bestf, besth,
+                    besti, bestl, bestw, bestb, bestub, bestd, type_code);
+          stage_i[q] = bidx;
+        }
+        bestf = 0.f; besth = 0; besti = 0; bestl = 0; bestw = 0;
+        bestb = 0; bestub = 0; bestd = 0;
+        bidx = 0; first = 1; sv_base = -1;
+        cur_row = row;
+      }
+      int off = c * chunk_elems;
+      int len = N - off < chunk_elems ? N - off : chunk_elems;
+      switch (type_code) {
+        case T_F16:
+            proc_f16(buf[s & 1], len, off, &besth, &bidx, &first, sv_f16, &sv_base);
+            break;
+        case T_I32:
+            proc_i32(buf[s & 1], len, off, &besti, &bidx, &first, sv_i32, &sv_base);
+            break;
+        case T_I64: proc_i64(buf[s & 1], len, off, &bestl, &bidx, &first); break;
+        case T_I16: proc_i16(buf[s & 1], len, off, &bestw, &bidx, &first); break;
+        case T_I8: proc_i8(buf[s & 1], len, off, &bestb, &bidx, &first); break;
+        case T_U8: proc_u8(buf[s & 1], len, off, &bestub, &bidx, &first); break;
+        default: proc_f64(buf[s & 1], len, off, &bestd, &bidx, &first); break;
+      }
+    }
+    if (cur_row >= 0) {
+      if (sv_base >= 0) {
+        if (type_code == T_F16) bidx = resolve_f16(sv_f16, besth, sv_base);
+        else if (type_code == T_I32) bidx = resolve_i32(sv_i32, besti, sv_base);
+      }
+      int q = cur_row - w;
+      stage_val((__local__ char *)stage_v, q, esz, bestf, besth,
+                besti, bestl, bestw, bestb, bestub, bestd, type_code);
+      stage_i[q] = bidx;
+    }
+    int cnt = wend - w;
+    LM2GM_ASYNC(stage_v, out_val + (long long)w * esz, cnt * esz);
+    LM2GM_ASYNC(stage_i, out_idx + w, cnt * 8);
+  }
+  mfence();
+}
+
+extern "C" __device__ void md_row_raw(
+    _global_ptr_ const char *in,
+    _global_ptr_ char *out_val,
+    _global_ptr_ long long *out_idx,
+    int M, int N, int esz, int type_code,
+    int rows_start, int rows_count, int rpc) {
+  int cid = core_id();
+  int ncores = core_num();
+  int row_end = rows_start + rows_count;
+  if (row_end > M) row_end = M;
+  int nrows = row_end - rows_start;
+  if (nrows <= 0) return;
+
+  // rpc = rows per core, chosen so each core's output block is >= 8 bytes
+  // (narrow <8B global stores are pathologically slow on this device), and so
+  // that at most 64 cores per cluster are used. (An unequal floor/ceil split
+  // activating all 64 cores measured no gain: the critical path is still the
+  // longest per-core row chain, and DMA is already near the HBM roofline.)
+  int per = rpc > 0 ? rpc : (nrows + ncores - 1) / ncores;
+  int my0 = rows_start + cid * per;
+  if (my0 >= row_end) return;
+  int my1 = my0 + per;
+  if (my1 > row_end) my1 = row_end;
+
+  int chunk_elems = CHUNK_BYTES / esz;
+  int nch = (N + chunk_elems - 1) / chunk_elems;
+
+  // f32/bf16 always take the vector-accumulate path (the old per-vector
+  // vrmax + branch proc serializes ~0.6us per 3KB chunk). fp16 uses the
+  // legacy path for long rows (a single 32-lane vrmax per group beats the
+  // f16->f32 vector conversion) but the vector path for short rows (the
+  // legacy row machinery outweighs the tiny row work).
+  // fp16 keeps the legacy path for long rows: a single 32-lane
+  // vrmax_float16x32 per group beats the f16->f32 vector conversion (measured
+  // 46.3us vs 47.9us on [4096,4096]), and the legacy row machinery wins for
+  // short rows; the vector path is best for f32/bf16.
+  if (type_code == T_F32 || type_code == T_BF16 ||
+      (type_code == T_F16 && N < 512)) {
+    md_row_vec(in, out_val, out_idx, M, N, esz, type_code, my0, my1,
+               chunk_elems, nch);
+  } else {
+    md_row_legacy(in, out_val, out_idx, M, N, esz, type_code, my0, my1,
+                  chunk_elems, nch);
+  }
+}
