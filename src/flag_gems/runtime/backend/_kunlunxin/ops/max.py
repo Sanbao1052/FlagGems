@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import builtins
 import logging
+import math
+import os
 from collections import namedtuple
 
 import torch
@@ -24,6 +27,186 @@ from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
+Max_out = namedtuple("max", ["values", "indices"])
+
+# ---------------------------------------------------------------------------
+# tle.raw fast path (P800 xpu3, cluster C payload in max_raw.xpu).
+#
+# The compiler-generated Triton `max_kernel` runs at 34GB/s on [4096,4096]
+# dim=1 (speedup 0.02): the whole-row 512x4096 tile forces CoreTiling into
+# 256 serial 2-row iterations, each with a small fenced DMA plus a masked
+# read-modify-write of the outputs, and N-loop tiling cannot compile at all
+# (uni_sram overflow). The hand-written payload drives per-core GM2LM DMA
+# with a flat chunk pipeline, keeps the winning vector for the argmax scan,
+# and flushes contiguous per-core output blocks; it reaches ~0.6-0.8 on the
+# same shapes. See op-opti/max_dim.md for the full analysis.
+try:
+    import triton.experimental.tle as tle
+
+    _TLE_OK = True
+except ImportError:
+    tle = None
+    _TLE_OK = False
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_NCLUSTER = 12  # P800 (xpu3): one Triton program == one cluster of 64 cores
+# Payload scalars are i32 (do_not_specialize); guard the byte range.
+_RAW_MAX_ELEMS = 2**31 - 1
+
+_RAW_TYPE_CODE = {
+    torch.float32: 0,
+    torch.float16: 1,
+    torch.bfloat16: 2,
+    torch.int32: 3,
+    torch.int64: 4,
+    torch.int16: 5,
+    torch.int8: 6,
+    torch.uint8: 7,
+    torch.bool: 7,
+    torch.float64: 8,
+}
+
+if _TLE_OK:
+
+    @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "max_raw.xpu"),
+                    flags=[f"-I{_HERE}"])
+    def md_row_raw(in_, out_val, out_idx, M, N, esz, type_code, rows_start,
+                   rows_count):
+        ...
+
+    @triton.jit(do_not_specialize=["M", "N", "esz", "type_code", "per", "rpc"])
+    def max_dim_raw_kernel(In, OutV, OutI, M, N, esz, type_code, per, rpc):
+        pid = tl.program_id(0)
+        tle.raw.call(
+            md_row_raw, (In, OutV, OutI, M, N, esz, type_code, pid * per, per, rpc)
+        )
+
+    @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "max_full_sm.xpu"),
+                    flags=[f"-I{_HERE}"])
+    def m_full_raw(in_, mid, M, esz, type_code, per, slot):
+        ...
+
+    @triton.jit(do_not_specialize=["M", "esz", "type_code", "per"])
+    def max_full_raw_kernel(In, Mid, M, esz, type_code, per):
+        pid = tl.program_id(0)
+        tle.raw.call(m_full_raw, (In, Mid, M, esz, type_code, per, pid))
+
+    @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "max_full_sm.xpu"),
+                    flags=[f"-I{_HERE}"])
+    def m_combine_raw(mid, out, n, esz, type_code):
+        ...
+
+    @triton.jit(do_not_specialize=["n", "esz", "type_code"])
+    def max_full_combine_kernel(Mid, Out, n, esz, type_code):
+        tle.raw.call(m_combine_raw, (Mid, Out, n, esz, type_code))
+
+
+def _view_u8(t):
+    """Byte view of a tensor; works for 0-dim tensors too."""
+    if t.dim() == 0:
+        return t.view(1).view(torch.uint8)
+    return t.view(torch.uint8)
+
+
+def _raw_max_dim(inp, dim, keepdim):
+    """max.dim along the innermost (contiguous) dim via the raw payload.
+
+    Returns (values, indices) or None when the raw path does not apply.
+    """
+    if not _TLE_OK:
+        return None
+    type_code = _RAW_TYPE_CODE.get(inp.dtype)
+    if type_code is None:
+        return None
+    shape = inp.shape
+    N = shape[dim]
+    M = shape[:dim] and math.prod(shape[:dim]) or 1
+    K = inp.numel() // M // N
+    if K != 1:  # payload assumes contiguous rows of length N
+        return None
+    M = inp.numel() // N  # total rows (M * K with K == 1)
+    if M * N > _RAW_MAX_ELEMS:
+        return None
+    esz = inp.element_size()
+
+    shape_list = list(shape)
+    shape_list[dim] = 1
+    out_value = torch.empty(shape_list, dtype=inp.dtype, device=inp.device)
+    out_index = torch.empty(shape_list, dtype=torch.int64, device=inp.device)
+    if not keepdim:
+        out_value = torch.squeeze(out_value, dim)
+        out_index = torch.squeeze(out_index, dim)
+
+    # Rows per core: each core's output block must be >= 8 bytes (narrow <8B
+    # global stores are pathologically slow on this device). For large M the
+    # default 12-cluster split already yields >=8B blocks; for small M we
+    # consolidate into fewer clusters so every active core writes a full rpc
+    # block (e.g. [64,64] fp16: rpc=4 -> 16 active cores, 8B stores).
+    per_core_default = (math.ceil(M / _NCLUSTER) + 63) // 64
+    rpc = builtins.max(per_core_default, (8 + esz - 1) // esz)
+    if per_core_default * esz < 8:
+        grid_n = builtins.max(1, builtins.min(_NCLUSTER, (M + rpc * 64 - 1) // (rpc * 64)))
+    else:
+        grid_n = _NCLUSTER
+    per = (M + grid_n - 1) // grid_n
+    with torch_device_fn.device(inp.device):
+        max_dim_raw_kernel[(grid_n,)](
+            _view_u8(inp),
+            _view_u8(out_value),
+            out_index,
+            M,
+            N,
+            esz,
+            type_code,
+            per,
+            rpc,
+        )
+    return out_value, out_index
+
+
+def _raw_max_full(inp):
+    """Full-tensor max via per-core partials + a tiny combine kernel.
+
+    Returns the scalar result tensor, or None when not applicable.
+    """
+    if not _TLE_OK:
+        return None
+    type_code = _RAW_TYPE_CODE.get(inp.dtype)
+    if type_code is None:
+        return None
+    M = inp.numel()
+    if M > _RAW_MAX_ELEMS:
+        return None
+    esz = inp.element_size()
+
+    ncores = _NCLUSTER * 64
+    # mid: 8-byte slots. float dtypes + i32 use the per-cluster SM reduce
+    # inside the payload (12 slots); other dtypes write per-core 8B partials
+    # (768 slots). k2 reads the first nused slots either way.
+    float_i32 = inp.dtype in (torch.float32, torch.float16, torch.bfloat16,
+                              torch.int32)
+    nused = min(_NCLUSTER, M) if float_i32 else min(ncores, M)
+    per = (M + ncores - 1) // ncores
+    mid = torch.empty(ncores * 8, dtype=torch.uint8, device=inp.device)
+    out = torch.empty([], dtype=inp.dtype, device=inp.device)
+    with torch_device_fn.device(inp.device):
+        max_full_raw_kernel[(_NCLUSTER,)](
+            _view_u8(inp),
+            mid,
+            M,
+            esz,
+            type_code,
+            per,
+        )
+        max_full_combine_kernel[(1,)](
+            mid,
+            _view_u8(out),
+            nused,
+            esz,
+            type_code,
+        )
+    return out
+
 
 _FULL_REDUCTION_BLOCK_SIZE = 8192
 
@@ -214,10 +397,15 @@ def max(inp):
     logger.debug("GEMS_KUNLUNXIN MAX")
     inp = inp.contiguous().reshape(-1)  # 1-D flat view (3-D kernel args crash on XPU)
     M = inp.numel()
-    dtype = inp.dtype
-    out = torch.empty([], dtype=dtype, device=inp.device)
     if M == 1:
         return inp.reshape([])
+    # tle.raw fast path: per-cluster SM reduce (12 GM partials) beats the
+    # packed-tile two-kernel on this shape (1D 0.28-0.47 -> 0.73-0.82).
+    raw_out = _raw_max_full(inp) if _TLE_OK else None
+    if raw_out is not None:
+        return raw_out
+    dtype = inp.dtype
+    out = torch.empty([], dtype=dtype, device=inp.device)
     with torch_device_fn.device(inp.device):
         _max_flat(inp, out, inp.device)
     return out
@@ -227,10 +415,17 @@ def max_dim(inp, dim=None, keepdim=False):
     logger.debug("GEMS_KUNLUNXIN MAX_DIM")
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
 
-    Max_out = namedtuple("max", ["values", "indices"])
+    dim = dim % inp.ndim
+    # tle.raw fast path for the contiguous inner-dim (K == 1) reduction; the
+    # compiler row-reduce is structurally capped on this XPU (wide-row
+    # CoreTiling serialization), and the payload reaches 0.77-1.0 on the core
+    # shapes. PR's packed-tile kernel handles K > 1 / padded shapes below.
+    inp = inp.contiguous()
+    raw = _raw_max_dim(inp, dim, keepdim) if _TLE_OK else None
+    if raw is not None:
+        return Max_out(values=raw[0], indices=raw[1])
 
     shape = inp.shape
-    dim = dim % inp.ndim
     N = shape[dim]
     dtype = inp.dtype
 

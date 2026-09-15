@@ -1,0 +1,267 @@
+#include "max_common.inc"
+
+// ---------------- full-reduction entry (aten::max on a flat tensor) --------
+// Per-cluster SM reduction (borrowed from the vendor tensor_calc_scalar
+// pattern): every core reduces its slice and publishes a monotonic-int64 key
+// to a per-cluster SM slot; a cluster barrier (sync_all) lets core 0 take the
+// max over the 64 slots and write ONE 8-byte partial per cluster (12 GM slots
+// total). This avoids the 768 narrow per-core global stores that are
+// pathologically slow on this device (the previous k1 dominated the 1D
+// latency: 2B stores ~+18us). m_combine_raw then reduces the 12 slots.
+static __shared__ unsigned int sm_partial[64];
+
+static __device__ __attribute__((always_inline)) int f2mi(float x) {
+  unsigned u;
+  __builtin_memcpy(&u, &x, 4);
+  return (u & 0x80000000u) ? ~(int)u : (int)(u | 0x80000000u);
+}
+static __device__ __attribute__((always_inline)) float mi2f(int m) {
+  unsigned u = (unsigned)m;
+  // decode: m with the sign bit set came from a positive float (clear it);
+  // m with it clear came from a negative float (invert)
+  if (u & 0x80000000u) u = u & 0x7FFFFFFFu; else u = ~u;
+  float x;
+  __builtin_memcpy(&x, &u, 4);
+  return x;
+}
+static __device__ __attribute__((always_inline)) long long f642mi(double x) {
+  unsigned long long u;
+  __builtin_memcpy(&u, &x, 8);
+  return (u & 0x8000000000000000ULL) ? ~(long long)u
+                                     : (long long)(u | 0x8000000000000000ULL);
+}
+static __device__ __attribute__((always_inline)) double mi2f64(long long m) {
+  unsigned long long u = (unsigned long long)m;
+  if (u & 0x8000000000000000ULL) u = u & 0x7FFFFFFFFFFFFFFFULL; else u = ~u;
+  double x;
+  __builtin_memcpy(&x, &u, 8);
+  return x;
+}
+
+// unsigned-ordered key for the SM cluster reduce (float dtypes + i32 only;
+// other dtypes fall back to per-core 8B GM partials in m_full_raw). The float
+// monotonic keys and the i32 sign-flip are both ordered by UNSIGNED compare,
+// which the cluster max below uses.
+static __device__ __attribute__((always_inline)) unsigned int val_to_key(
+    int type_code, float bestf, _Float16 besth, int besti) {
+  switch (type_code) {
+    case T_F32: return (unsigned int)f2mi(bestf);
+    case T_BF16: return (unsigned int)f2mi(bestf);
+    case T_F16: return (unsigned int)f2mi((float)besth);
+    default: return ((unsigned int)besti) ^ 0x80000000u;  // T_I32
+  }
+}
+
+static __device__ __attribute__((always_inline)) void key_to_vals(
+    unsigned int k, int type_code, float *bestf, _Float16 *besth, int *besti) {
+  switch (type_code) {
+    case T_F32: *bestf = mi2f((int)k); break;
+    case T_BF16: *bestf = mi2f((int)k); break;
+    case T_F16: *bestf = mi2f((int)k); *besth = (_Float16)*bestf; break;
+    default: *besti = (int)(k ^ 0x80000000u); break;  // T_I32
+  }
+}
+
+extern "C" __device__ void m_full_raw(
+    _global_ptr_ const char *in,
+    _global_ptr_ char *mid,
+    int M, int esz, int type_code,
+    int per, int slot) {
+  __attribute__((aligned(64))) __local__ char buf[NBUF][CHUNK_BYTES];
+  __local__ float sv_f32[16];
+  __local__ _Float16 sv_f16[32];
+  __local__ int sv_i32[16];
+  __local__ unsigned short sv_bf16[32];
+
+  int cid = core_id();
+  int elems_start = (slot * 64 + cid) * per;
+  int end = elems_start + per;
+  if (end > M) end = M;
+
+  int chunk_elems = CHUNK_BYTES / esz;
+  int nch = end > elems_start
+                ? (end - elems_start + chunk_elems - 1) / chunk_elems
+                : 0;
+
+  float bestf = 0.f;
+  _Float16 besth = 0;
+  int besti = 0;
+  long long bestl = 0;
+  short bestw = 0;
+  signed char bestb = 0;
+  unsigned char bestub = 0;
+  double bestd = 0;
+  int bidx = 0;
+  int first = 1;
+  int sv_base = -1;
+
+  int off = elems_start;
+  int issued = 0;
+  int cur = 0;
+  if (nch > 0) {
+    int len = end - off < chunk_elems ? end - off : chunk_elems;
+    GM2LM_ASYNC(in + (long long)off * esz, buf[0], len * esz);
+    issued = 1;
+  }
+  while (off < end) {
+    mfence_lm();
+    if (issued < nch) {
+      int ioff = elems_start + issued * chunk_elems;
+      int ilen = end - ioff < chunk_elems ? end - ioff : chunk_elems;
+      GM2LM_ASYNC(in + (long long)ioff * esz, buf[issued & 1], ilen * esz);
+      ++issued;
+    }
+    int len = end - off < chunk_elems ? end - off : chunk_elems;
+    switch (type_code) {
+      case T_F32:
+        proc_f32(buf[cur], len, off, &bestf, &bidx, &first, sv_f32, &sv_base);
+        break;
+      case T_F16:
+        proc_f16(buf[cur], len, off, &besth, &bidx, &first, sv_f16, &sv_base);
+        break;
+      case T_BF16:
+        proc_bf16(buf[cur], len, off, &bestf, &bidx, &first, sv_bf16, &sv_base);
+        break;
+      case T_I32:
+        proc_i32(buf[cur], len, off, &besti, &bidx, &first, sv_i32, &sv_base);
+        break;
+      case T_I64: proc_i64(buf[cur], len, off, &bestl, &bidx, &first); break;
+      case T_I16: proc_i16(buf[cur], len, off, &bestw, &bidx, &first); break;
+      case T_I8: proc_i8(buf[cur], len, off, &bestb, &bidx, &first); break;
+      case T_U8: proc_u8(buf[cur], len, off, &bestub, &bidx, &first); break;
+      default: proc_f64(buf[cur], len, off, &bestd, &bidx, &first); break;
+    }
+    off += len;
+    cur ^= 1;
+  }
+  // float dtypes + i32 take the per-cluster SM reduce (12 GM slots, no narrow
+  // stores); other dtypes fall back to per-core 8-byte partials.
+  if (type_code == T_F32 || type_code == T_F16 || type_code == T_BF16 ||
+      type_code == T_I32) {
+    if (nch == 0) {
+      // empty cores must publish the max-identity so they never win
+      bestf = -__builtin_huge_valf();
+      besth = (_Float16)(-__builtin_huge_valf());
+      besti = 0x80000000;
+    }
+    unsigned int key = val_to_key(type_code, bestf, besth, besti);
+    sm_partial[cid] = key;
+    mfence_sm();
+    sync_all();
+    if (cid == 0) {
+      unsigned int m = sm_partial[0];
+      for (int i = 1; i < 64; ++i)
+        if (sm_partial[i] > m) m = sm_partial[i];
+      key_to_vals(m, type_code, &bestf, &besth, &besti);
+      __local__ char pval[8];
+      stage_val(pval, 0, esz, bestf, besth, besti, bestl, bestw, bestb,
+                bestub, bestd, type_code);
+      // one 8-byte partial per cluster (slots 0..11)
+      LM2GM(pval, mid + (long long)slot * 8, 8);
+    }
+  } else {
+    _global_ptr_ char *dst = mid + (long long)(slot * 64 + cid) * 8;
+    __local__ char pval[8];
+    stage_val(pval, 0, esz, bestf, besth, besti, bestl, bestw, bestb,
+              bestub, bestd, type_code);
+    LM2GM(pval, dst, 8);
+  }
+  mfence();
+}
+
+// ---------------- combine entry: reduce mid[0..n) to one scalar ------------
+// Runs on a single core (n is at most nclusters*64); avoids the masked-load
+// "other=" pitfalls of the compiler-generated combine kernel.
+
+extern "C" __device__ void m_combine_raw(
+    _global_ptr_ const char *mid,
+    _global_ptr_ char *out,
+    int n, int esz, int type_code) {
+  if (core_id() != 0) return;
+  // mid holds n 8-byte slots: 12 for the float/i32 SM-reduce path, up to 768
+  // for the per-core fallback. Read them in 96B chunks (a single 96B read
+  // covers the common 12-slot case).
+  __attribute__((aligned(64))) __local__ char buf[12 * 8];
+  float bestf = 0.f;
+  _Float16 besth = 0;
+  int besti = 0;
+  long long bestl = 0;
+  short bestw = 0;
+  signed char bestb = 0;
+  unsigned char bestub = 0;
+  double bestd = 0;
+  int first = 1;
+  for (int base = 0; base < n; base += 12) {
+    int cnt = n - base < 12 ? n - base : 12;
+    GM2LM(mid + (long long)base * 8, buf, cnt * 8);
+    for (int kk = 0; kk < cnt; ++kk) {
+      int k = base + kk;
+      const char *p = buf + kk * 8;
+      switch (type_code) {
+      case T_F32: {
+        float v;
+        __builtin_memcpy(&v, p, 4);
+        if (first || v > bestf) { bestf = v; first = 0; }
+        break;
+      }
+      case T_F16: {
+        unsigned short h;
+        __builtin_memcpy(&h, p, 2);
+        _Float16 v;
+        __builtin_memcpy(&v, &h, 2);
+        if (first || v > besth) { besth = v; first = 0; }
+        break;
+      }
+      case T_BF16: {
+        unsigned short h;
+        __builtin_memcpy(&h, p, 2);
+        unsigned bits = ((unsigned)h) << 16;
+        float v = *(float *)&bits;
+        if (first || v > bestf) { bestf = v; first = 0; }
+        break;
+      }
+      case T_I32: {
+        int v;
+        __builtin_memcpy(&v, p, 4);
+        if (first || v > besti) { besti = v; first = 0; }
+        break;
+      }
+      case T_I64: {
+        long long v;
+        __builtin_memcpy(&v, p, 8);
+        if (first || v > bestl) { bestl = v; first = 0; }
+        break;
+      }
+      case T_I16: {
+        short v;
+        __builtin_memcpy(&v, p, 2);
+        if (first || v > bestw) { bestw = v; first = 0; }
+        break;
+      }
+      case T_I8: {
+        signed char v;
+        __builtin_memcpy(&v, p, 1);
+        if (first || v > bestb) { bestb = v; first = 0; }
+        break;
+      }
+      case T_U8: {
+        unsigned char v;
+        __builtin_memcpy(&v, p, 1);
+        if (first || v > bestub) { bestub = v; first = 0; }
+        break;
+      }
+      default: {
+        double v;
+        __builtin_memcpy(&v, p, 8);
+        if (first || v > bestd) { bestd = v; first = 0; }
+        break;
+      }
+      }
+    }
+  }
+  __local__ char pval[8];
+  stage_val(pval, 0, esz, bestf, besth, besti, bestl, bestw, bestb, bestub,
+            bestd, type_code);
+  LM2GM(pval, out, esz);
+  mfence();
+}
