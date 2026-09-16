@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import builtins
 import logging
 import math
+import os
 from collections import namedtuple
 
 import torch
@@ -27,6 +29,308 @@ from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.limits import get_dtype_max
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# tle.raw fast path (P800 xpu3, cluster C payload in min_raw.xpu). min_dim
+# routes every supported contiguous inner-dim (K == 1) reduction here first:
+# the compiler row-reduce is structurally capped on this XPU (wide-row
+# CoreTiling serialization + uni_sram OOR), the payload reaches 0.77-1.0 on
+# the core shapes. MIN_USE_TLE=0 disables it (tle.gpu / pure-Triton fallback
+# only; used to evaluate the skill kernels).
+# ---------------------------------------------------------------------------
+_MIN_USE_TLE = os.environ.get("MIN_USE_TLE", "1") != "0"  # default ON (raw payload approved for the row-reduce path); MIN_USE_TLE=0 forces the tle.gpu / pure-Triton fallback
+try:
+    import triton.experimental.tle as tle
+
+    _TLE_OK = _MIN_USE_TLE
+except ImportError:
+    tle = None
+    _TLE_OK = False
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_NCLUSTER = 12  # P800 (xpu3): one Triton program == one cluster of 64 cores
+# Payload scalars are i32 (do_not_specialize); guard the byte range.
+_RAW_MIN_ELEMS = 2**31 - 1
+
+_RAW_TYPE_CODE = {
+    torch.float32: 0,
+    torch.float16: 1,
+    torch.bfloat16: 2,
+    torch.int32: 3,
+    torch.int64: 4,
+    torch.int16: 5,
+    torch.int8: 6,
+    torch.uint8: 7,
+    torch.bool: 7,
+    torch.float64: 8,
+}
+
+if _TLE_OK:
+
+    @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "min_raw.xpu"),
+                     flags=[f"-I{_HERE}"])
+    def min_row_raw(in_, out_val, out_idx, M, N, esz, type_code, rows_start,
+                    rows_count, rpc):
+        ...
+
+    @triton.jit(do_not_specialize=["M", "N", "esz", "type_code", "per", "rpc"])
+    def min_dim_raw_kernel(In, OutV, OutI, M, N, esz, type_code, per, rpc):
+        pid = tl.program_id(0)
+        tle.raw.call(
+            min_row_raw, (In, OutV, OutI, M, N, esz, type_code, pid * per, per, rpc)
+        )
+
+    @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "min_full_sm.xpu"),
+                     flags=[f"-I{_HERE}"])
+    def min_full_raw(in_, mid, M, esz, type_code, per, slot):
+        ...
+
+    @triton.jit(do_not_specialize=["M", "esz", "type_code", "per"])
+    def min_full_raw_kernel(In, Mid, M, esz, type_code, per):
+        pid = tl.program_id(0)
+        tle.raw.call(min_full_raw, (In, Mid, M, esz, type_code, per, pid))
+
+    @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "min_full_sm.xpu"),
+                     flags=[f"-I{_HERE}"])
+    def min_combine_raw(mid, out, n, esz, type_code):
+        ...
+
+    @triton.jit(do_not_specialize=["n", "esz", "type_code"])
+    def min_full_combine_kernel(Mid, Out, n, esz, type_code):
+        tle.raw.call(min_combine_raw, (Mid, Out, n, esz, type_code))
+
+
+def _view_u8(t):
+    """Byte view of a tensor; works for 0-dim tensors too."""
+    if t.dim() == 0:
+        return t.view(1).view(torch.uint8)
+    return t.view(torch.uint8)
+
+
+def _raw_min_dim(inp, dim, keepdim):
+    """min.dim along the innermost (contiguous) dim via the raw payload.
+
+    Returns (values, indices) or None when the raw path does not apply.
+    """
+    if not _TLE_OK:
+        return None
+    type_code = _RAW_TYPE_CODE.get(inp.dtype)
+    if type_code is None:
+        return None
+    shape = inp.shape
+    N = shape[dim]
+    M = shape[:dim] and math.prod(shape[:dim]) or 1
+    K = inp.numel() // M // N
+    if K != 1:  # payload assumes contiguous rows of length N
+        return None
+    M = inp.numel() // N  # total rows (M * K with K == 1)
+    if M * N > _RAW_MIN_ELEMS:
+        return None
+    esz = inp.element_size()
+
+    shape_list = list(shape)
+    shape_list[dim] = 1
+    out_value = torch.empty(shape_list, dtype=inp.dtype, device=inp.device)
+    out_index = torch.empty(shape_list, dtype=torch.int64, device=inp.device)
+    if not keepdim:
+        out_value = torch.squeeze(out_value, dim)
+        out_index = torch.squeeze(out_index, dim)
+
+    # Rows per core: each core's output block must be >= 8 bytes (narrow <8B
+    # global stores are pathologically slow on this device). For large M the
+    # default 12-cluster split already yields >=8B blocks; for small M we
+    # consolidate into fewer clusters so every active core writes a full rpc
+    # block (e.g. [64,64] fp16: rpc=4 -> 16 active cores, 8B stores).
+    per_core_default = (math.ceil(M / _NCLUSTER) + 63) // 64
+    rpc = builtins.max(per_core_default, (8 + esz - 1) // esz)
+    if per_core_default * esz < 8:
+        grid_n = builtins.max(1, builtins.min(_NCLUSTER, (M + rpc * 64 - 1) // (rpc * 64)))
+    else:
+        grid_n = _NCLUSTER
+    per = (M + grid_n - 1) // grid_n
+    with torch_device_fn.device(inp.device):
+        min_dim_raw_kernel[(grid_n,)](
+            _view_u8(inp),
+            _view_u8(out_value),
+            out_index,
+            M,
+            N,
+            esz,
+            type_code,
+            per,
+            rpc,
+        )
+    return out_value, out_index
+
+
+def _raw_min_full(inp):
+    """Full-tensor min via per-cluster partials + a tiny combine kernel.
+
+    Returns the scalar result tensor, or None when not applicable. The payload
+    does a per-cluster SM reduce (12 GM partials) instead of the 768 narrow
+    per-core stores that dominated the 1D latency.
+    """
+    if not _TLE_OK:
+        return None
+    type_code = _RAW_TYPE_CODE.get(inp.dtype)
+    if type_code is None:
+        return None
+    M = inp.numel()
+    if M > _RAW_MIN_ELEMS:
+        return None
+    esz = inp.element_size()
+
+    ncores = _NCLUSTER * 64
+    # mid: 8-byte slots. float dtypes + i32 use the per-cluster SM reduce
+    # inside the payload (12 slots); other dtypes write per-core 8B partials
+    # (768 slots). The combine reads the first nused slots either way.
+    float_i32 = inp.dtype in (torch.float32, torch.float16, torch.bfloat16,
+                              torch.int32)
+    nused = builtins.min(_NCLUSTER, M) if float_i32 else builtins.min(ncores, M)
+    per = (M + ncores - 1) // ncores
+    mid = torch.empty(ncores * 8, dtype=torch.uint8, device=inp.device)
+    out = torch.empty([], dtype=inp.dtype, device=inp.device)
+    with torch_device_fn.device(inp.device):
+        min_full_raw_kernel[(_NCLUSTER,)](
+            _view_u8(inp),
+            mid,
+            M,
+            esz,
+            type_code,
+            per,
+        )
+        min_full_combine_kernel[(1,)](
+            mid,
+            _view_u8(out),
+            nused,
+            esz,
+            type_code,
+        )
+    return out
+
+# ---------------------------------------------------------------------------
+# tle.gpu fast path for min.dim (fp16, contiguous innermost dim, K == 1),
+# following PR #6311's sum_dim row-reduce pattern: one TensorDescriptor per
+# [XBLOCK, YBLOCK] tile, tle.gpu.copy GM -> LM -> registers, and the running
+# per-row best kept as a packed int32 key. The value and the first-min column
+# are packed into one word -- key = signed_order(value16) << 16 | col -- so a
+# single tl.min(key, axis=1) per tile resolves both, ties going to the FIRST
+# column (ATen semantics). The order transform is the signed-order encoding
+# (negative floats -> (~u)^0x8000, positive -> u), which needs SHIFT == 16 so
+# the value's sign bit lands on key bit 31 (the int32 min on this backend is
+# SIGNED; SHIFT < 16 inverts the ordering -- measured). The index ALU is the
+# dominant cost here, so YBLOCK is pushed to the LM limit (2048 fp16 at XBLOCK
+# 64) to minimise the number of per-tile reduces.
+#
+# Short tiles are NOT masked: the copy clamps to the descriptor, the stale LM
+# bytes are cleared with the min identity (dtype-max) on the one step that can
+# be short, and rows whose winning key came from the padding (col >= N, i.e.
+# every real element is +inf) are repaired to +inf / index 0.
+try:
+    import triton.experimental.tle.language as tle
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _TLE_GPU_OK = True
+except ImportError:
+    tle = None
+    TensorDescriptor = None
+    _TLE_GPU_OK = False
+
+
+if _TLE_GPU_OK:
+
+    @triton.jit(do_not_specialize=["N"],
+                do_not_specialize_on_alignment=["a_desc", "ov_desc", "oi_desc"])
+    def _tle_min_row_kernel(
+        a_desc, ov_desc, oi_desc, N,
+        XBLOCK: tl.constexpr, YBLOCK: tl.constexpr,
+        NEED_PAD: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        row_off = pid * XBLOCK
+        a_lmem = tle.gpu.alloc([XBLOCK, YBLOCK], dtype=tl.float16,
+                               layout=None, scope=tle.gpu.lmem)
+        ov_lmem = tle.gpu.alloc([XBLOCK], dtype=tl.float16,
+                                layout=None, scope=tle.gpu.lmem)
+        oi_lmem = tle.gpu.alloc([XBLOCK], dtype=tl.int64,
+                                layout=None, scope=tle.gpu.lmem)
+        row_ids = tl.broadcast_to(tl.arange(0, XBLOCK)[:, None], (XBLOCK, YBLOCK))
+        col_ids = tl.broadcast_to(tl.arange(0, YBLOCK)[None, :], (XBLOCK, YBLOCK))
+        a_ptrs = tle.gpu.local_ptr(a_lmem, (row_ids, col_ids))
+        ov_ptrs = tle.gpu.local_ptr(ov_lmem, (tl.arange(0, XBLOCK),))
+        oi_ptrs = tle.gpu.local_ptr(oi_lmem, (tl.arange(0, XBLOCK),))
+        best = tl.full([XBLOCK], 2147483647, tl.int32)
+        for coff in tl.range(0, N, YBLOCK):
+            if NEED_PAD:
+                if coff + YBLOCK > N:
+                    tl.store(a_ptrs, tl.full([XBLOCK, YBLOCK], 65504.0, tl.float16))
+            tle.gpu.copy(a_desc, a_lmem, [XBLOCK, YBLOCK], [row_off, coff])
+            u16 = tl.load(a_ptrs).to(tl.int16, bitcast=True)
+            key16 = tl.where(u16 < 0, (~u16) ^ -32768, u16)
+            key = (((key16.to(tl.int32) & 0xFFFF) << 16) | (coff + col_ids))
+            best = tl.minimum(best, tl.min(key, axis=1))
+        k = best
+        col = k & 0xFFFF
+        vb = (k >> 16) & 0xFFFF
+        v16 = tl.where(vb >= 0x8000, (~vb) ^ -32768, vb)
+        vf = v16.to(tl.int16).to(tl.float16, bitcast=True)
+        broken = col >= N
+        inf_bits = tl.full([XBLOCK], 0x7C00, tl.int16)
+        vf = tl.where(broken, inf_bits.to(tl.float16, bitcast=True), vf)
+        col = tl.where(broken, 0, col)
+        tl.store(ov_ptrs, vf)
+        tl.store(oi_ptrs, col.to(tl.int64))
+        tle.gpu.copy(ov_lmem, ov_desc, [XBLOCK], [row_off])
+        tle.gpu.copy(oi_lmem, oi_desc, [XBLOCK], [row_off])
+
+
+def _tle_min_dim(inp, dim, keepdim):
+    """fp16 min.dim via the tle.gpu row-reduce; None when not applicable."""
+    if not _TLE_GPU_OK:
+        return None
+    if inp.dtype != torch.float16:
+        return None
+    shape = inp.shape
+    N = shape[dim]
+    M = shape[:dim] and math.prod(shape[:dim]) or 1
+    K = inp.numel() // M // N
+    if K != 1:  # payload assumes contiguous rows of length N
+        return None
+    M = inp.numel() // N
+    # The packed int32 key holds 16 value bits + 16 column bits, so N must fit
+    # in 16 bits. Below M=256 the per-element ALU + launch overhead loses to
+    # the chunked three-pass path; the benchmark-relevant win is M >= 4096.
+    if not (256 <= M <= 2**31 - 1 and 64 <= N <= 65535):
+        return None
+    if M * N > 2**31 - 1:
+        return None
+
+    shape_list = list(shape)
+    shape_list[dim] = 1
+    out_value = torch.empty(shape_list, dtype=inp.dtype, device=inp.device)
+    out_index = torch.empty(shape_list, dtype=torch.int64, device=inp.device)
+
+    # fp16 min geometry: XBLOCK 64 (one row per core), YBLOCK to the LM limit
+    # (2048 fp16 = 4 KB/core at XBLOCK 64). Measured [4096,4096]: XB=64/YB=2048
+    # 368us vs XB=512/YB=256 798us (the per-element key ALU dominates, so few
+    # big tiles beat the sum-dim preference for wide XBLOCK).
+    xblock = 64
+    yblock = triton.next_power_of_2(N) if N < 2048 else 2048
+    with torch_device_fn.device(inp.device):
+        grid = (triton.cdiv(M, xblock),)
+        _tle_min_row_kernel[grid](
+            TensorDescriptor.from_tensor(inp, block_shape=[xblock, yblock]),
+            TensorDescriptor.from_tensor(out_value.view(-1), block_shape=[xblock]),
+            TensorDescriptor.from_tensor(out_index.view(-1), block_shape=[xblock]),
+            N,
+            xblock,
+            yblock,
+            N % yblock != 0,
+        )
+    if not keepdim:
+        out_value = torch.squeeze(out_value, dim)
+        out_index = torch.squeeze(out_index, dim)
+    return out_value, out_index
 
 # NOTE (kunlunxin/XPU): performance recipe (2026-08-17) follows the
 # amax/amin 2026-08-16 closure for the value-only paths and the argmin
@@ -168,6 +472,11 @@ def min_kernel(
         update = local_min < min_values
         min_values = tl.where(update, local_min, min_values)
         argmin_values = tl.where(update, start_n + local_argmin, argmin_values)
+
+    # f32 identity-clamp (see min_kernel_1 note): an all-+inf f32 row must
+    # give the device-native FLT_MAX, matching torch.min on this backend.
+    if dtype is tl.float32:
+        min_values = tl.minimum(min_values, 3.4028234663852886e+38)
 
     offset_index = m_offset * K + pid_k
     out_value_ptrs = out_value + offset_index
@@ -371,6 +680,14 @@ def _min_flat(inp, out, device):
 
 def min(inp):
     logger.debug("GEMS_KUNLUNXIN MIN")
+    # tle.raw fast path: the per-cluster SM reduce + tiny combine reaches
+    # ~0.9x on the 1D flat shapes; the pure-Triton _min_flat is structurally
+    # capped (~0.26x on 1M: a single-cluster 2D row reduce -- more programs
+    # measured SLOWER on this backend, so no Triton tiling fixes it).
+    inp = inp.contiguous()
+    raw = _raw_min_full(inp) if _TLE_OK else None
+    if raw is not None:
+        return raw
     dtype = inp.dtype
     out = torch.empty([], dtype=dtype, device=inp.device)
     with torch_device_fn.device(inp.device):
@@ -404,6 +721,10 @@ def min_split_kernel(
         else:
             a = tl.load(inp + cols).to(tl.float32)
         blk = tl.min(a, axis=1)[:, None]
+        # f32 identity-clamp (see min_kernel_1 note): an all-+inf f32 row must
+        # give the device-native FLT_MAX, matching torch.min on this backend.
+        if inp.type.element_ty is tl.float32:
+            blk = tl.minimum(blk, 3.4028234663852886e+38)
         if NEED_MASK:
             tl.store(part_val + rows.to(tl.int64) + ic * M, blk, mask=row_mask)
         else:
@@ -496,6 +817,19 @@ def min_dim(inp, dim=None, keepdim=False):
     M = math.prod(shape[:dim])
     K = inp.numel() // M // N
 
+    # ---- tle.raw fast path (big contiguous inner-dim reductions) ----------
+    # Mirrors max_dim: the payload reaches 0.77-1.0 on the core shapes while
+    # the compiler row-reduce is structurally capped on this XPU (wide-row
+    # CoreTiling serialization + uni_sram OOR on the tiled kernels). The
+    # tle.gpu / three-pass / legacy paths below are the fallbacks for shapes
+    # the payload cannot handle (K > 1, out-of-i32-range, unsupported dtypes).
+    inp = inp.contiguous()
+    if len(shape) > 1:
+        raw = _raw_min_dim(inp, dim, keepdim) if _TLE_OK else None
+        if raw is not None:
+            Min_out = namedtuple("min", ["values", "indices"])
+            return Min_out(values=raw[0], indices=raw[1])
+
     shape_list = list(shape)
     shape_list[dim] = 1
     out_value = torch.empty(shape_list, dtype=inp.dtype, device=inp.device)
@@ -512,6 +846,12 @@ def min_dim(inp, dim=None, keepdim=False):
             out_index = torch.squeeze(out_index, dim)
         Min_out = namedtuple("min", ["values", "indices"])
         return Min_out(values=out_value, indices=out_index)
+
+    # ---- tle.gpu fast path (fp16, contiguous innermost dim) ---------------
+    tle_res = _tle_min_dim(inp, dim, keepdim) if _TLE_GPU_OK else None
+    if tle_res is not None:
+        Min_out = namedtuple("min", ["values", "indices"])
+        return Min_out(values=tle_res[0], indices=tle_res[1])
 
     # ---- fast chunked three-pass path (floats only, N >= _FAST_MIN_N) ----
     if N >= _FAST_MIN_N and _is_fast_dtype(inp.dtype):
