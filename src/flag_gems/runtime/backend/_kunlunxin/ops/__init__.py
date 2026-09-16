@@ -42,9 +42,7 @@ from ._scaled_dot_product_fused_attention_overrideable import (
     _scaled_dot_product_fused_attention_overrideable,
 )
 from ._thnn_fused_lstm_cell_backward_impl import _thnn_fused_lstm_cell_backward_impl
-from ._unsafe_masked_index_put_accumulate import _unsafe_masked_index_put_accumulate
-from ._upsample_bilinear2d_aa import _upsample_bilinear2d_aa  # noqa: F401
-from ._upsample_nearest_exact2d_backward import _upsample_nearest_exact2d_backward
+from ._jagged_to_padded_dense_forward import _jagged_to_padded_dense_forward
 from .abs import abs, abs_
 from .absolute import absolute, absolute_
 from .acos import acos, acos_
