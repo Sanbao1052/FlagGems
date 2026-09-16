@@ -236,6 +236,15 @@ def greater_scalar(A, B):
     # trips `arith.cmpf requires all operands to have the same type` and blows the
     # uni_sram budget -> `out of resource: uni_sram` compile failure (fp16). The
     # sibling gt_scalar deliberately omits them for the same reason.
+    if (
+        A.is_contiguous()
+        and A.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and (numel := A.numel()) >= _GREATER_SCALAR_FAST_TILE
+        and numel % _GREATER_SCALAR_FAST_TILE == 0
+        and numel // _GREATER_SCALAR_FAST_TILE >= _GREATER_SCALAR_MIN_GRID
+        and float(B) == float(torch.tensor(float(B), dtype=A.dtype).item())
+    ):
+        return _greater_scalar_fast(A, float(B))
     res = greater_func_scalar(A, B)
     return res
 
