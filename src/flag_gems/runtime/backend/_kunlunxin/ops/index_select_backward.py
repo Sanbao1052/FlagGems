@@ -1,4 +1,5 @@
 import logging
+import math
 
 import torch
 import triton
@@ -353,12 +354,88 @@ def _pad_a(a, M, K, Mp, Kp, device):
 
 
 def _materialize(res, self_sizes, dtype, device):
-    """Exact-shape (contiguous) 2-D result -> the (strided) output layout."""
-    if res.shape == torch.Size(self_sizes):
-        return res
+    """(R0, R1) GEMM slice -> row-major n-D output (identity in 2-D space).
+
+    ``res`` and the n-D output share the same flat ordering: the GEMM runs on
+    the flattened (M, L) / (L, M) view, so a plain 2-D copy is exact for both
+    the last-dim and first-dim layouts (and 1-D: res is (1, D)).
+    """
+    r0, r1 = res.shape
+    assert r0 * r1 == math.prod(self_sizes), (res.shape, self_sizes)
     target = torch.empty(self_sizes, dtype=dtype, device=device)
-    _isb_copy(res.view(self_sizes), target, self_sizes[0], self_sizes[1], device)
+    _isb_copy(res, target.view(r0, r1), r0, r1, device)
     return target
+
+
+@triton.jit
+def _isb_transpose_kernel(
+    Src,
+    Dst,
+    A,
+    B,
+    D,
+    s0,
+    s1,
+    s2,
+    d0,
+    d1,
+    d2,
+    BLOCK_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Batched 2-D transpose: Dst[a, d, b] = Src[a, b, d] for a in [0, A),
+    # b in [0, B), d in [0, D).  Src/Dst are the 3-D views of the (M, D)
+    # GEMM result / row-major n-D output (M = A*B); runtime strides make this
+    # layout-agnostic (ragged edges via masks + other=).
+    pid = ext.program_id(0)
+    grid_b = tl.cdiv(B, BLOCK_B)
+    grid_d = tl.cdiv(D, BLOCK_D)
+    a = pid // (grid_b * grid_d)
+    t = pid % (grid_b * grid_d)
+    rb = (t // grid_d) * BLOCK_B + tl.arange(0, BLOCK_B)
+    rd = (t % grid_d) * BLOCK_D + tl.arange(0, BLOCK_D)
+    mm = (rb < B)[:, None] & (rd < D)[None, :]
+    v = tl.load(
+        Src + a * s0 + rb[:, None] * s1 + rd[None, :] * s2,
+        mask=mm,
+        other=0.0,
+    )
+    tl.store(
+        Dst + a * d0 + rd[:, None] * d1 + rb[None, :] * d2,
+        v,
+        mask=mm,
+    )
+
+
+_ISB_TRANSPOSE_BB = 64
+_ISB_TRANSPOSE_BD = 64
+
+
+def _isb_transpose(src, dst, A, B, D, device):
+    """Batched 2-D transpose: dst.view(A, D, B) <- src.view(A, B, D).
+
+    ``src`` is the (A*B, D) GEMM result (a strided slice of the padded
+    buffer, so runtime strides keep the kernel layout-agnostic); ``dst`` is
+    the row-major n-D output whose ``dim`` axis has size D.
+    """
+    grid = (A * triton.cdiv(B, _ISB_TRANSPOSE_BB) * triton.cdiv(D, _ISB_TRANSPOSE_BD),)
+    with torch_device_fn.device(device):
+        _isb_transpose_kernel[grid](
+            src,
+            dst,
+            A,
+            B,
+            D,
+            B * src.stride(0),
+            src.stride(0),
+            src.stride(1),
+            D * B,
+            B,
+            1,
+            BLOCK_B=_ISB_TRANSPOSE_BB,
+            BLOCK_D=_ISB_TRANSPOSE_BD,
+            num_warps=4,
+        )
 
 
 def _isb_last(grad, self_sizes, dtype, device, index, index_len, dim_size_out):
@@ -405,13 +482,13 @@ def _isb_mid(grad, self_sizes, dim, dtype, device, index, index_len, dim_size_ou
     _one_hot_write(oh, index, index_len, dim_size_out, device)
     out2d = _isb_gemm_large(grad_flat, oh, M, index_len, dim_size_out, Mp, Kp, Np, device)
     res = out2d[:M, :dim_size_out]
-    compressed_shape = list(grad_compressed.shape)
-    compressed_shape[-1] = dim_size_out
+    # dim_compress moves dim to last, giving (A, ..., B, L); the (M=A*B, D)
+    # GEMM result maps to the row-major output (A, D, B) as a batched
+    # 2-D transpose.
+    A = math.prod(self_sizes[:dim])
+    B = math.prod(self_sizes[dim + 1 :])
     target = torch.empty(self_sizes, dtype=dtype, device=device)
-    view = res.view(compressed_shape)
-    order = list(range(grad.ndim - 1))
-    order.insert(dim, grad.ndim - 1)
-    _isb_copy(view.permute(order), target, self_sizes[0], self_sizes[1], device)
+    _isb_transpose(res, target, A, B, dim_size_out, device)
     return target
 
 
@@ -447,13 +524,10 @@ def _isb_small_mid(grad, self_sizes, dim, dtype, device, index, index_len, dim_s
     oh = torch.zeros((index_len, dim_size_out), dtype=dtype, device=device)
     _one_hot_write(oh, index, index_len, dim_size_out, device)
     res = _isb_gemm_small(grad_flat, oh, M, index_len, dim_size_out, device)
-    compressed_shape = list(grad_compressed.shape)
-    compressed_shape[-1] = dim_size_out
+    A = math.prod(self_sizes[:dim])
+    B = math.prod(self_sizes[dim + 1 :])
     target = torch.empty(self_sizes, dtype=dtype, device=device)
-    view = res.view(compressed_shape)
-    order = list(range(grad.ndim - 1))
-    order.insert(dim, grad.ndim - 1)
-    _isb_copy(view.permute(order), target, self_sizes[0], self_sizes[1], device)
+    _isb_transpose(res, target, A, B, dim_size_out, device)
     return target
 
 
