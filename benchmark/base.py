@@ -1106,7 +1106,6 @@ class TexGluForwardBenchmark(TexGluBenchmark):
         shape = list(args[0].shape)
         return torch.tensor(shape).prod().item()
 
-
 class TexGluBackwardBenchmark(TexGluBenchmark):
     def get_input_iter(self, dtype):
         for shape in self.shapes:
@@ -1117,10 +1116,7 @@ class TexGluBackwardBenchmark(TexGluBenchmark):
 
             grad_out = torch.randn(out_shape, dtype=dtype, device=self.device)
 
-            if vendor_name == "kunlunxin":
-                yield grad_out, inp
-            else:
-                yield grad_out, inp, None
+            yield grad_out, inp, None
 
     def supports_cases(self) -> bool:
         if (
@@ -1149,8 +1145,6 @@ class TexGluBackwardBenchmark(TexGluBenchmark):
         shape, grad_out_shape = plan.builder_args
         inp = generate_tensor_input(shape, case.dtype, self.device)
         grad_out = torch.randn(grad_out_shape, dtype=case.dtype, device=self.device)
-        if vendor_name == "kunlunxin":
-            return grad_out, inp
         return grad_out, inp, plan.params["quantizer"]
 
     def get_tflops(self, op, *args, **kwargs):
