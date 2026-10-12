@@ -1106,7 +1106,6 @@ class TexGluForwardBenchmark(TexGluBenchmark):
         shape = list(args[0].shape)
         return torch.tensor(shape).prod().item()
 
-
 class TexGluBackwardBenchmark(TexGluBenchmark):
     def get_input_iter(self, dtype):
         for shape in self.shapes:
